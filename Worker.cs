@@ -15,7 +15,7 @@ public class OpencodeWorker : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        var opencodePath = _config["Opencode:Path"] ?? "opencode";
+        var opencodePath = ResolveOpenCodeFromPath();
         var port = _config["Opencode:Port"] ?? "4096";
         var hostname = _config["Opencode:Hostname"] ?? "127.0.0.1";
         var username = _config["Opencode:Username"] ?? "opencode";
@@ -84,6 +84,27 @@ public class OpencodeWorker : BackgroundService
             _logger.LogInformation("Restarting opencode web in 5 seconds...");
             await Task.Delay(5000, stoppingToken);
         }
+    }
+
+    private static string ResolveOpenCodeFromPath()
+    {
+        var path = Environment.GetEnvironmentVariable("PATH")
+                   ?? Environment.GetEnvironmentVariable("Path")
+                   ?? string.Empty;
+
+        var extensions = new[] { ".cmd", ".bat", ".exe" };
+
+        foreach (var dir in path.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
+        {
+            foreach (var ext in extensions)
+            {
+                var fullPath = Path.Combine(dir.Trim(), "opencode" + ext);
+                if (File.Exists(fullPath))
+                    return fullPath;
+            }
+        }
+
+        return "opencode";
     }
 
     private void ReadStream(StreamReader reader, bool isError)
