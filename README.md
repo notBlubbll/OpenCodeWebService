@@ -6,7 +6,7 @@ Windows Service that launches and manages the [opencode](https://github.com/anom
 
 - Runs as a Windows Service named **OpencodeWeb**
 - Spawns `opencode web --port <port> --hostname <hostname>` on startup
-- Sets `OPENCODE_SERVER_USERNAME` and `OPENCODE_SERVER_PASSWORD` environment variables for the child process
+- Sets `OPENCODE_SERVER_USERNAME`, `OPENCODE_SERVER_PASSWORD`, and `OPENCODE_EXPERIMENTAL_WEBSOCKETS` environment variables for the child process
 - Captures stdout/stderr and forwards them to the Windows Event Log
 - Auto-restarts opencode after a 5-second delay if the process exits unexpectedly
 
@@ -26,7 +26,8 @@ Edit `appsettings.json` in the publish output (or `appsettings.Development.json`
     "Port": "4096",
     "Hostname": "127.0.0.1",
     "Username": "opencode",
-    "Password": ""
+    "Password": "",
+    "ExperimentalWebsockets": "TRUE"
   }
 }
 ```
@@ -38,6 +39,7 @@ Edit `appsettings.json` in the publish output (or `appsettings.Development.json`
 | `Hostname` | Bind hostname (default: `127.0.0.1`) |
 | `Username` | HTTP Basic Auth username via `OPENCODE_SERVER_USERNAME` |
 | `Password` | HTTP Basic Auth password via `OPENCODE_SERVER_PASSWORD` |
+| `ExperimentalWebsockets` | Enable experimental websockets via `OPENCODE_EXPERIMENTAL_WEBSOCKETS` (default: `TRUE`) |
 
 ## Build
 

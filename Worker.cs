@@ -20,6 +20,7 @@ public class OpencodeWorker : BackgroundService
         var hostname = _config["Opencode:Hostname"] ?? "127.0.0.1";
         var username = _config["Opencode:Username"] ?? "opencode";
         var password = _config["Opencode:Password"] ?? "";
+        var experimentalWebsockets = _config["Opencode:ExperimentalWebsockets"] ?? "TRUE";
 
         while (!stoppingToken.IsCancellationRequested)
         {
@@ -35,6 +36,7 @@ public class OpencodeWorker : BackgroundService
 
             psi.EnvironmentVariables["OPENCODE_SERVER_USERNAME"] = username;
             psi.EnvironmentVariables["OPENCODE_SERVER_PASSWORD"] = password;
+            psi.EnvironmentVariables["OPENCODE_EXPERIMENTAL_WEBSOCKETS"] = experimentalWebsockets;
 
             var process = new Process { StartInfo = psi, EnableRaisingEvents = true };
 

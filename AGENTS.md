@@ -34,7 +34,7 @@ Properties/
 - **Primary constructor**: not used — prefer explicit constructors
 - **Logging**: use `ILogger<T>` (not `Console.WriteLine`)
 - **Stream reading**: handled in `ReadStream` with `ObjectDisposedException` / `IOException` suppression for teardown safety
-- **Configuration**: `IConfiguration` with the `"Opencode:"` prefix for opencode settings
+- **Configuration**: `IConfiguration` with the `"Opencode:"` prefix for opencode settings (`Port`, `Hostname`, `Username`, `Password`, `ExperimentalWebsockets`)
 - **Graceful shutdown**: support `CancellationToken` propagation; kill child process on stop
 - **Auto-restart**: 5-second delay on unexpected exit, infinite loop while not cancelled
 
