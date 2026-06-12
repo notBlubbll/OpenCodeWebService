@@ -34,9 +34,10 @@ Properties/
 - **Primary constructor**: not used — prefer explicit constructors
 - **Logging**: use `ILogger<T>` (not `Console.WriteLine`)
 - **Stream reading**: handled in `ReadStream` with `ObjectDisposedException` / `IOException` suppression for teardown safety
-- **Configuration**: `IConfiguration` with the `"Opencode:"` prefix for opencode settings (`Port`, `Hostname`, `Username`, `Password`, `ExperimentalWebsockets`)
+- **Configuration**: `IConfiguration` with the `"Opencode:"` prefix for opencode settings (`Port`, `Hostname`, `Username`, `Password`, `ExperimentalWebsockets`); defaults are `Port: 80`, `Hostname: 127.0.0.2`
 - **Graceful shutdown**: support `CancellationToken` propagation; kill child process on stop
 - **Auto-restart**: 5-second delay on unexpected exit, infinite loop while not cancelled
+- **Port cleanup**: before each start, `Worker.cs` frees the configured port by killing the owning process and, if necessary, deleting matching entries from the IPv4 TCP table via `iphlpapi.dll`
 
 ## Adding packages
 
