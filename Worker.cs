@@ -10,6 +10,12 @@ public class OpencodeWorker : BackgroundService
     private readonly ILogger<OpencodeWorker> _logger;
     private readonly IConfiguration _config;
 
+    private static readonly string[] NoisyPrefixes = new[]
+    {
+        "PowerShell discovery failed",
+        "Config updated:",
+    };
+
     public OpencodeWorker(ILogger<OpencodeWorker> logger, IConfiguration config)
     {
         _logger = logger;
@@ -369,6 +375,12 @@ public class OpencodeWorker : BackgroundService
                 var line = reader.ReadLine();
                 if (line is null) break;
 
+                if (IsNoisy(line))
+                {
+                    _logger.LogDebug("[opencode] {Msg}", line);
+                    continue;
+                }
+
                 if (isError)
                     _logger.LogWarning("[stderr] {Msg}", line);
                 else
@@ -377,6 +389,17 @@ public class OpencodeWorker : BackgroundService
         }
         catch (ObjectDisposedException) { }
         catch (IOException) { }
+    }
+
+    private static bool IsNoisy(string line)
+    {
+        foreach (var prefix in NoisyPrefixes)
+        {
+            if (line.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
     }
 
     private static class PortNuker
