@@ -1,7 +1,6 @@
 using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
-using System.Runtime.InteropServices;
 
 namespace OpenCodeWebService;
 
@@ -24,7 +23,10 @@ public class OpencodeWorker : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        var opencodePath = _config["Opencode:Path"] ?? ResolveOpenCodeFromPath();
+        var configuredPath = _config["Opencode:Path"];
+        var opencodePath = !string.IsNullOrWhiteSpace(configuredPath) && Path.IsPathRooted(configuredPath)
+            ? configuredPath
+            : ResolveOpenCodeFromPath();
         var proxyPortText = _config["Opencode:Port"] ?? "80";
         var proxyHost = _config["Opencode:Hostname"] ?? "127.0.0.2";
         var username = _config["Opencode:Username"] ?? "opencode";
@@ -39,7 +41,6 @@ public class OpencodeWorker : BackgroundService
 
         while (!stoppingToken.IsCancellationRequested)
         {
-            FreeProxy(proxyHost, proxyPort);
             RemoveProxy(proxyHost, proxyPort);
 
             try
@@ -51,24 +52,43 @@ public class OpencodeWorker : BackgroundService
                 break;
             }
 
+            int actualPort;
+            try
+            {
+                actualPort = GetFreePort();
+                _logger.LogInformation("Allocated free port {ActualPort} on {ProxyHost} for opencode", actualPort, proxyHost);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to allocate a free port");
+                await Task.Delay(5000, stoppingToken);
+                continue;
+            }
+
             var psi = new ProcessStartInfo
             {
                 FileName = opencodePath,
-                Arguments = "web --port 0 --hostname 127.0.0.1",
+                Arguments = $"web --port {actualPort} --hostname {proxyHost}",
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 CreateNoWindow = true,
             };
 
-            if (!string.IsNullOrEmpty(username))
-                psi.EnvironmentVariables["OPENCODE_SERVER_USERNAME"] = username;
+            foreach (var key in psi.EnvironmentVariables.Keys.Cast<string>().ToList())
+            {
+                if (key.StartsWith("OPENCODE_", StringComparison.OrdinalIgnoreCase))
+                    psi.EnvironmentVariables.Remove(key);
+            }
+
             if (!string.IsNullOrEmpty(password))
+            {
                 psi.EnvironmentVariables["OPENCODE_SERVER_PASSWORD"] = password;
+                if (!string.IsNullOrEmpty(username))
+                    psi.EnvironmentVariables["OPENCODE_SERVER_USERNAME"] = username;
+            }
             if (!string.IsNullOrEmpty(experimentalWebsockets))
                 psi.EnvironmentVariables["OPENCODE_EXPERIMENTAL_WEBSOCKETS"] = experimentalWebsockets;
-            psi.EnvironmentVariables["OPENCODE_DISABLE_EMBEDDED_WEB_UI"] = "true";
-            psi.EnvironmentVariables["BROWSER"] = "none";
 
             var process = new Process { StartInfo = psi, EnableRaisingEvents = true };
             var started = false;
@@ -98,18 +118,16 @@ public class OpencodeWorker : BackgroundService
                     exitedTcs.TrySetResult(true);
                 };
 
-                var actualPort = await FindOpencodePort(process.Id, stoppingToken);
-                _logger.LogInformation("FindOpencodePort returned actualPort={ActualPort}", actualPort);
-
-                if (actualPort > 0)
+                if (await WaitForPort(proxyHost, actualPort, stoppingToken))
                 {
-                    _logger.LogInformation("Opencode listening on port {ActualPort}, creating proxy {ProxyHost}:{ProxyPort} -> 127.0.0.1:{ActualPort}",
-                        actualPort, proxyHost, proxyPort, actualPort);
-                    CreateProxy(proxyHost, proxyPort, actualPort);
+                    _logger.LogInformation("Opencode listening on {ProxyHost}:{ActualPort}, creating proxy {ProxyHost}:{ProxyPort} -> {ProxyHost}:{ActualPort}",
+                        proxyHost, actualPort, proxyHost, proxyPort, proxyHost, actualPort);
+                    CreateProxy(proxyHost, proxyPort, proxyHost, actualPort);
                 }
                 else
                 {
-                    _logger.LogWarning("Did not detect a valid opencode port; proxy will not be created");
+                    _logger.LogWarning("Opencode did not start listening on {ProxyHost}:{ActualPort}; proxy will not be created",
+                        proxyHost, actualPort);
                 }
 
                 await Task.WhenAny(exitedTcs.Task, Task.Delay(Timeout.Infinite, stoppingToken));
@@ -158,97 +176,90 @@ public class OpencodeWorker : BackgroundService
         }
     }
 
-    private void CreateProxy(string listenHost, int listenPort, int targetPort)
+    private TcpListener? _proxyListener;
+    private CancellationTokenSource? _proxyCts;
+
+    private void CreateProxy(string listenHost, int listenPort, string targetHost, int targetPort)
     {
         try
         {
-            RunNetsh($"interface portproxy add v4tov4 listenaddress={listenHost} listenport={listenPort} " +
-                     $"connectaddress=127.0.0.1 connectport={targetPort}");
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Failed to create portproxy for {Host}:{Port} -> 127.0.0.1:{TargetPort}",
-                listenHost, listenPort, targetPort);
-        }
-    }
+            RemoveProxy();
 
-    private void RemoveProxy(string listenHost, int listenPort)
-    {
-        try
-        {
-            RunNetsh($"interface portproxy delete v4tov4 listenaddress={listenHost} listenport={listenPort}");
-        }
-        catch (Exception ex)
-        {
-            _logger.LogDebug(ex, "No portproxy to remove for {Host}:{Port} (expected on first run)",
-                listenHost, listenPort);
-        }
-    }
+            var ip = IPAddress.Parse(listenHost);
+            _proxyListener = new TcpListener(ip, listenPort);
+            _proxyListener.Start();
+            _proxyCts = new CancellationTokenSource();
+            var token = _proxyCts.Token;
 
-    private void RunNetsh(string arguments)
-    {
-        var psi = new ProcessStartInfo("netsh", arguments)
-        {
-            CreateNoWindow = true,
-            UseShellExecute = false,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-        };
-        using var process = Process.Start(psi);
-        if (process is null)
-        {
-            _logger.LogWarning("Failed to start netsh for '{Arguments}'", arguments);
-            return;
-        }
-        process.WaitForExit(10000);
-        if (process.ExitCode != 0)
-        {
-            var err = process.StandardError.ReadToEnd();
-            _logger.LogWarning("netsh returned exit code {ExitCode}: {Error}", process.ExitCode, err.Trim());
-        }
-    }
+            _logger.LogInformation("TCP proxy listening on {Host}:{Port} -> {TargetHost}:{TargetPort}",
+                listenHost, listenPort, targetHost, targetPort);
 
-    private void FreeProxy(string hostname, int port)
-    {
-        try
-        {
-            var pids = GetListenerPids(port, hostname);
-            foreach (var pid in pids)
+            _ = Task.Run(async () =>
             {
-                try
+                while (!token.IsCancellationRequested)
                 {
-                    var existing = Process.GetProcessById(pid);
-                    _logger.LogWarning(
-                        "Killing process {ProcessName} (PID {Pid}) holding proxy port {Port}",
-                        existing.ProcessName, pid, port);
-                    existing.Kill(entireProcessTree: true);
-                    existing.WaitForExit(5000);
+                    TcpClient? client = null;
+                    try
+                    {
+                        client = await _proxyListener.AcceptTcpClientAsync(token);
+                        _ = Task.Run(() => ForwardConnection(client, targetHost, targetPort, token), token);
+                    }
+                    catch (OperationCanceledException) { break; }
+                    catch (ObjectDisposedException) { break; }
+                    catch (Exception ex)
+                    {
+                        _logger.LogDebug(ex, "Proxy accept failed");
+                        client?.Dispose();
+                    }
                 }
-                catch (ArgumentException) { }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "Could not kill process PID {Pid} holding port {Port}", pid, port);
-                }
-            }
+            }, token);
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Process kill scan failed for proxy port {Port}", port);
-        }
-
-        try
-        {
-            int cleared = PortNuker.DeleteTcpEntriesForLocalPort(port);
-            if (cleared > 0)
-                _logger.LogWarning("Nuked {Count} TCP entries for proxy port {Port}", cleared, port);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Nuclear TCP table cleanup failed for proxy port {Port}", port);
+            _logger.LogWarning(ex, "Failed to create TCP proxy for {Host}:{Port} -> {TargetHost}:{TargetPort}",
+                listenHost, listenPort, targetHost, targetPort);
         }
     }
 
-    private static async Task<int> FindOpencodePort(int pid, CancellationToken stoppingToken)
+    private async Task ForwardConnection(TcpClient client, string targetHost, int targetPort, CancellationToken token)
+    {
+        try
+        {
+            using var target = new TcpClient();
+            await target.ConnectAsync(targetHost, targetPort);
+            using var clientStream = client.GetStream();
+            using var targetStream = target.GetStream();
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(token);
+            var c2t = clientStream.CopyToAsync(targetStream, cts.Token);
+            var t2c = targetStream.CopyToAsync(clientStream, cts.Token);
+            await Task.WhenAny(c2t, t2c);
+            cts.Cancel();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Proxy connection forward ended");
+        }
+        finally
+        {
+            try { client.Close(); } catch { }
+        }
+    }
+
+    private static int GetFreePort()
+    {
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        try
+        {
+            return ((IPEndPoint)listener.LocalEndpoint).Port;
+        }
+        finally
+        {
+            listener.Stop();
+        }
+    }
+
+    private static async Task<bool> WaitForPort(string host, int port, CancellationToken stoppingToken)
     {
         for (var attempt = 0; attempt < 30; attempt++)
         {
@@ -258,102 +269,69 @@ public class OpencodeWorker : BackgroundService
             }
             catch (OperationCanceledException)
             {
-                return -1;
+                return false;
             }
 
-            var psi = new ProcessStartInfo
+            try
             {
-                FileName = "cmd.exe",
-                Arguments = $"/c netstat -ano | findstr \"{pid}\"",
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = false,
-                CreateNoWindow = true,
-            };
-
-            using var process = Process.Start(psi);
-            if (process is null) continue;
-            var output = process.StandardOutput.ReadToEnd();
-            process.WaitForExit();
-
-            foreach (var line in output.Split('\n', '\r'))
+                using var client = new TcpClient();
+                await client.ConnectAsync(host, port);
+                return true;
+            }
+            catch
             {
-                var parts = line.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
-                if (parts.Length < 4)
-                    continue;
-
-                var localAddress = parts[1];
-                var state = parts[3];
-
-                if (!state.Equals("LISTENING", StringComparison.OrdinalIgnoreCase))
-                    continue;
-
-                var addressPort = localAddress.Split(':');
-                if (addressPort.Length < 2)
-                    continue;
-
-                if (int.TryParse(addressPort[^1], out var port) && port > 0)
-                    return port;
             }
         }
-
-        return -1;
+        return false;
     }
 
-    private static List<int> GetListenerPids(int port, string hostname)
+    private void RemoveProxy(string listenHost, int listenPort)
     {
-        var pids = new List<int>();
-        var search = $"{hostname}:{port}";
+        RemoveProxy();
+    }
 
-        var psi = new ProcessStartInfo
+    private void RemoveProxy()
+    {
+        try
         {
-            FileName = "cmd.exe",
-            Arguments = $"/c netstat -ano | findstr \"{search}\"",
-            UseShellExecute = false,
-            RedirectStandardOutput = true,
-            RedirectStandardError = false,
-            CreateNoWindow = true,
-        };
-
-        using var process = Process.Start(psi);
-        if (process is null)
-            return pids;
-
-        var output = process.StandardOutput.ReadToEnd();
-        process.WaitForExit();
-
-        foreach (var line in output.Split('\n', '\r'))
-        {
-            var parts = line.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
-            if (parts.Length < 5)
-                continue;
-
-            var localAddress = parts[1];
-            var state = parts[3];
-            var pidText = parts[4];
-
-            if (!localAddress.Equals(search, StringComparison.OrdinalIgnoreCase))
-                continue;
-
-            if (!state.Equals("LISTENING", StringComparison.OrdinalIgnoreCase))
-                continue;
-
-            if (int.TryParse(pidText, out var pid) && !pids.Contains(pid))
-                pids.Add(pid);
+            _proxyCts?.Cancel();
+            _proxyListener?.Stop();
+            _proxyListener = null;
+            _proxyCts?.Dispose();
+            _proxyCts = null;
         }
-
-        return pids;
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "No TCP proxy to remove (expected on first run)");
+        }
     }
 
     private static string ResolveOpenCodeFromPath()
     {
+        var extensions = new[] { ".cmd", ".bat", ".ps1", ".exe" };
+
+        var searchDirs = new List<string>();
+
         var path = Environment.GetEnvironmentVariable("PATH")
                    ?? Environment.GetEnvironmentVariable("Path")
                    ?? string.Empty;
+        searchDirs.AddRange(path.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries));
 
-        var extensions = new[] { ".cmd", ".bat", ".exe" };
+        var appData = Environment.GetEnvironmentVariable("APPDATA");
+        if (!string.IsNullOrEmpty(appData))
+            searchDirs.Add(Path.Combine(appData, "npm"));
 
-        foreach (var dir in path.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
+        var localAppData = Environment.GetEnvironmentVariable("LOCALAPPDATA");
+        if (!string.IsNullOrEmpty(localAppData))
+        {
+            searchDirs.Add(Path.Combine(localAppData, "npm"));
+            searchDirs.Add(Path.Combine(localAppData, "Microsoft", "WindowsApps"));
+        }
+
+        searchDirs.Add(@"C:\Program Files\nodejs");
+        searchDirs.Add(@"C:\Program Files (x86)\nodejs");
+
+        foreach (var dir in searchDirs)
         {
             foreach (var ext in extensions)
             {
@@ -362,6 +340,31 @@ public class OpencodeWorker : BackgroundService
                     return fullPath;
             }
         }
+
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = "where.exe",
+                Arguments = "opencode",
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                CreateNoWindow = true,
+            };
+            using var process = Process.Start(psi);
+            if (process is not null)
+            {
+                var output = process.StandardOutput.ReadToEnd().Trim();
+                process.WaitForExit();
+                if (process.ExitCode == 0 && !string.IsNullOrEmpty(output))
+                {
+                    var firstLine = output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)[0].Trim();
+                    if (File.Exists(firstLine))
+                        return firstLine;
+                }
+            }
+        }
+        catch { }
 
         return "opencode";
     }
@@ -400,88 +403,5 @@ public class OpencodeWorker : BackgroundService
         }
 
         return false;
-    }
-
-    private static class PortNuker
-    {
-        private const uint ERROR_INSUFFICIENT_BUFFER = 122;
-        private const uint MIB_TCP_STATE_DELETE_TCB = 12;
-
-        public static int DeleteTcpEntriesForLocalPort(int port)
-        {
-            uint targetPort = Htons((uint)port);
-            int cleared = 0;
-            IntPtr table = IntPtr.Zero;
-
-            try
-            {
-                uint size = 0;
-                uint result = GetTcpTable(IntPtr.Zero, ref size, true);
-                if (result != 0 && result != ERROR_INSUFFICIENT_BUFFER)
-                    throw new InvalidOperationException($"GetTcpTable returned {result}");
-
-                table = Marshal.AllocHGlobal((int)size);
-                result = GetTcpTable(table, ref size, true);
-                if (result != 0)
-                    throw new InvalidOperationException($"GetTcpTable returned {result}");
-
-                int rowCount = Marshal.ReadInt32(table);
-                int rowSize = Marshal.SizeOf(typeof(MIB_TCPROW));
-                IntPtr rowPtr = IntPtr.Add(table, sizeof(int));
-
-                for (int i = 0; i < rowCount; i++)
-                {
-                    var row = Marshal.PtrToStructure<MIB_TCPROW>(rowPtr);
-
-                    if (row.dwLocalPort == targetPort)
-                    {
-                        row.dwState = MIB_TCP_STATE_DELETE_TCB;
-
-                        IntPtr rowBuffer = Marshal.AllocHGlobal(rowSize);
-                        try
-                        {
-                            Marshal.StructureToPtr(row, rowBuffer, false);
-                            int setResult = SetTcpEntry(rowBuffer);
-                            if (setResult == 0)
-                                cleared++;
-                        }
-                        finally
-                        {
-                            Marshal.FreeHGlobal(rowBuffer);
-                        }
-                    }
-
-                    rowPtr += rowSize;
-                }
-            }
-            finally
-            {
-                if (table != IntPtr.Zero)
-                    Marshal.FreeHGlobal(table);
-            }
-
-            return cleared;
-        }
-
-        private static uint Htons(uint value)
-        {
-            return ((value & 0xFF) << 8) | ((value >> 8) & 0xFF);
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct MIB_TCPROW
-        {
-            public uint dwState;
-            public uint dwLocalAddr;
-            public uint dwLocalPort;
-            public uint dwRemoteAddr;
-            public uint dwRemotePort;
-        }
-
-        [DllImport("iphlpapi.dll", SetLastError = true)]
-        private static extern uint GetTcpTable(IntPtr pTcpTable, ref uint pdwSize, bool bOrder);
-
-        [DllImport("iphlpapi.dll", SetLastError = true)]
-        private static extern int SetTcpEntry(IntPtr pTcpRow);
     }
 }

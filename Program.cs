@@ -1,14 +1,9 @@
+using System.Diagnostics;
 using OpenCodeWebService;
 using Microsoft.Extensions.Hosting.WindowsServices;
 
-const string MutexName = "Global\\OpenCodeWebService_OpencodeWeb";
-
-using var mutex = new Mutex(false, MutexName, out var createdNew);
-if (!createdNew)
-{
-    Console.WriteLine("Another OpenCodeWebService instance is already running. Exiting.");
-    return;
-}
+KillExistingInstances();
+KillProcesses("opencode");
 
 var builder = Host.CreateApplicationBuilder(args);
 builder.Services.AddWindowsService(options =>
@@ -19,3 +14,39 @@ builder.Services.AddHostedService<OpencodeWorker>();
 
 var host = builder.Build();
 host.Run();
+
+static void KillExistingInstances()
+{
+    try
+    {
+        var current = Process.GetCurrentProcess();
+        foreach (var p in Process.GetProcessesByName(current.ProcessName))
+        {
+            if (p.Id == current.Id) continue;
+            try
+            {
+                p.Kill(entireProcessTree: true);
+                p.WaitForExit(3000);
+            }
+            catch { }
+        }
+    }
+    catch { }
+}
+
+static void KillProcesses(string name)
+{
+    try
+    {
+        foreach (var p in Process.GetProcessesByName(name))
+        {
+            try
+            {
+                p.Kill(entireProcessTree: true);
+                p.WaitForExit(3000);
+            }
+            catch { }
+        }
+    }
+    catch { }
+}
