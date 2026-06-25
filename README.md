@@ -29,7 +29,7 @@ Edit `appsettings.json` in the publish output (or `appsettings.Development.json`
     "Port": "80",
     "Hostname": "127.0.0.2",
     "Username": "opencode",
-    "ExperimentalWebsockets": "TRUE"
+    "ExperimentalWebsockets": "true"
   }
 }
 ```
@@ -41,7 +41,7 @@ Edit `appsettings.json` in the publish output (or `appsettings.Development.json`
 | `Hostname` | Bind hostname (default: `127.0.0.2`) |
 | `Username` | HTTP Basic Auth username via `OPENCODE_SERVER_USERNAME` |
 | `Password` | HTTP Basic Auth password via `OPENCODE_SERVER_PASSWORD` |
-| `ExperimentalWebsockets` | Enable experimental websockets via `OPENCODE_EXPERIMENTAL_WEBSOCKETS` (default: `TRUE`) |
+| `ExperimentalWebsockets` | Enable experimental websockets via `OPENCODE_EXPERIMENTAL_WEBSOCKETS` (default: `true`) |
 
 ## Build
 

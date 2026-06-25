@@ -71,7 +71,7 @@ public class OpencodeWorker : BackgroundService
         var proxyHost = _config["Opencode:Hostname"] ?? "127.0.0.2";
         var username = _config["Opencode:Username"] ?? "opencode";
         var password = _config["Opencode:Password"] ?? "";
-        var experimentalWebsockets = _config["Opencode:ExperimentalWebsockets"] ?? "TRUE";
+        var experimentalWebsockets = (_config["Opencode:ExperimentalWebsockets"] ?? "true").ToLower();
 
         if (!int.TryParse(proxyPortText, out var proxyPort))
         {
