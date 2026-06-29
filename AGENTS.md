@@ -36,7 +36,8 @@ Properties/
 - **Primary constructor**: not used — prefer explicit constructors
 - **Logging**: use `ILogger<T>` (not `Console.WriteLine`)
 - **Stream reading**: handled in `ReadStream` with `ObjectDisposedException` / `IOException` suppression for teardown safety
-- **Configuration**: `IConfiguration` with the `"Opencode:"` prefix for opencode settings (`Port`, `Hostname`, `Username`, `Password`, `ExperimentalWebsockets`); defaults are `Port: 80`, `Hostname: 127.0.0.2`
+- **Configuration**: `IConfiguration` with the `"Opencode:"` prefix for opencode settings (`Port`, `Hostname`, `Username`, `Password`, `ExperimentalWebsockets`, `SupportZeroTier`); defaults are `Port: 80`, `Hostname: 127.0.0.2`, `SupportZeroTier: false`
+- **ZeroTier support**: when `Opencode:SupportZeroTier` is `true`, the TCP proxy additionally binds every IPv4 on up ZeroTier adapters (detected by name/description containing "ZeroTier"), and the worker auto-creates a Windows Firewall inbound rule (`OpenCode Web (ZeroTier Inbound)`) scoped to `RemoteAddress 10.0.0.0/8`. All candidate listen IPs pass `IsSafeToListen` (loopback + RFC1918 only), so a public IP is never bound.
 - **Graceful shutdown**: support `CancellationToken` propagation; kill child process on stop
 - **Auto-restart**: 5-second delay on unexpected exit, infinite loop while not cancelled
 - **Port cleanup**: before each start, `Worker.cs` frees the configured port by killing the owning process and, if necessary, deleting matching entries from the IPv4 TCP table via `iphlpapi.dll`

@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Net;
+using System.Net.NetworkInformation;
 using System.Net.Sockets;
 
 namespace OpenCodeWebService;
@@ -72,12 +73,16 @@ public class OpencodeWorker : BackgroundService
         var username = _config["Opencode:Username"] ?? "opencode";
         var password = _config["Opencode:Password"] ?? "";
         var experimentalWebsockets = (_config["Opencode:ExperimentalWebsockets"] ?? "true").ToLower();
+        var supportZeroTier = IsFlagEnabled(_config["Opencode:SupportZeroTier"], defaultValue: false);
 
         if (!int.TryParse(proxyPortText, out var proxyPort))
         {
             _logger.LogWarning("Invalid Opencode:Port '{PortText}', falling back to 80", proxyPortText);
             proxyPort = 80;
         }
+
+        if (supportZeroTier)
+            EnsureZeroTierFirewallRule(proxyPort);
 
         while (!token.IsCancellationRequested)
         {
@@ -166,9 +171,11 @@ public class OpencodeWorker : BackgroundService
 
                 if (await WaitForPort(proxyHost, actualPort, token))
                 {
-                    _logger.LogInformation("Opencode listening on {ProxyHost}:{ActualPort}, creating proxy {ProxyHost}:{ProxyPort} -> {ProxyHost}:{ActualPort}",
-                        proxyHost, actualPort, proxyHost, proxyPort, proxyHost, actualPort);
-                    CreateProxy(proxyHost, proxyPort, proxyHost, actualPort);
+                    var listenIPs = GetListenIPs(proxyHost, supportZeroTier);
+                    var ipList = string.Join(", ", listenIPs.Select(ip => ip.ToString()));
+                    _logger.LogInformation("Opencode listening on {ProxyHost}:{ActualPort}, creating proxy on [{IPs}]:{ProxyPort} -> {ProxyHost}:{ActualPort}",
+                        proxyHost, actualPort, ipList, proxyPort, proxyHost, actualPort);
+                    CreateProxy(listenIPs, proxyPort, proxyHost, actualPort);
                 }
                 else
                 {
@@ -225,50 +232,74 @@ public class OpencodeWorker : BackgroundService
         _executeCts = null;
     }
 
-    private TcpListener? _proxyListener;
+    private List<TcpListener>? _proxyListeners;
     private CancellationTokenSource? _proxyCts;
     private Process? _opencodeProcess;
     private CancellationTokenSource? _executeCts;
 
-    private void CreateProxy(string listenHost, int listenPort, string targetHost, int targetPort)
+    private void CreateProxy(IReadOnlyList<IPAddress> listenIPs, int listenPort, string targetHost, int targetPort)
     {
         try
         {
             RemoveProxy();
 
-            var ip = IPAddress.Parse(listenHost);
-            _proxyListener = new TcpListener(ip, listenPort);
-            _proxyListener.Start();
+            _proxyListeners = new List<TcpListener>();
             _proxyCts = new CancellationTokenSource();
             var token = _proxyCts.Token;
 
-            _logger.LogInformation("TCP proxy listening on {Host}:{Port} -> {TargetHost}:{TargetPort}",
-                listenHost, listenPort, targetHost, targetPort);
+            foreach (var ip in listenIPs)
+            {
+                try
+                {
+                    var listener = new TcpListener(ip, listenPort);
+                    listener.Start();
+                    _proxyListeners.Add(listener);
+                    _logger.LogInformation("TCP proxy listening on {Host}:{Port} -> {TargetHost}:{TargetPort}",
+                        ip, listenPort, targetHost, targetPort);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to bind TCP proxy on {Host}:{Port}", ip, listenPort);
+                }
+            }
+
+            if (_proxyListeners.Count == 0)
+            {
+                _logger.LogWarning("No TCP proxy listeners were created for port {Port}", listenPort);
+                return;
+            }
 
             _ = Task.Run(async () =>
             {
-                while (!token.IsCancellationRequested)
-                {
-                    TcpClient? client = null;
-                    try
-                    {
-                        client = await _proxyListener.AcceptTcpClientAsync(token);
-                        _ = Task.Run(() => ForwardConnection(client, targetHost, targetPort, token), token);
-                    }
-                    catch (OperationCanceledException) { break; }
-                    catch (ObjectDisposedException) { break; }
-                    catch (Exception ex)
-                    {
-                        _logger.LogDebug(ex, "Proxy accept failed");
-                        client?.Dispose();
-                    }
-                }
+                var acceptTasks = _proxyListeners.Select(l => AcceptLoopAsync(l, targetHost, targetPort, token)).ToArray();
+                try { await Task.WhenAll(acceptTasks); }
+                catch (OperationCanceledException) { }
             }, token);
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Failed to create TCP proxy for {Host}:{Port} -> {TargetHost}:{TargetPort}",
-                listenHost, listenPort, targetHost, targetPort);
+            _logger.LogWarning(ex, "Failed to create TCP proxy for port {Port} -> {TargetHost}:{TargetPort}",
+                listenPort, targetHost, targetPort);
+        }
+    }
+
+    private async Task AcceptLoopAsync(TcpListener listener, string targetHost, int targetPort, CancellationToken token)
+    {
+        while (!token.IsCancellationRequested)
+        {
+            TcpClient? client = null;
+            try
+            {
+                client = await listener.AcceptTcpClientAsync(token);
+                _ = Task.Run(() => ForwardConnection(client, targetHost, targetPort, token), token);
+            }
+            catch (OperationCanceledException) { break; }
+            catch (ObjectDisposedException) { break; }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Proxy accept failed");
+                client?.Dispose();
+            }
         }
     }
 
@@ -363,8 +394,15 @@ public class OpencodeWorker : BackgroundService
         try
         {
             _proxyCts?.Cancel();
-            _proxyListener?.Stop();
-            _proxyListener = null;
+            if (_proxyListeners is not null)
+            {
+                foreach (var listener in _proxyListeners)
+                {
+                    try { listener.Stop(); } catch { }
+                }
+                _proxyListeners.Clear();
+                _proxyListeners = null;
+            }
             _proxyCts?.Dispose();
             _proxyCts = null;
         }
@@ -372,6 +410,161 @@ public class OpencodeWorker : BackgroundService
         {
             _logger.LogDebug(ex, "No TCP proxy to remove (expected on first run)");
         }
+    }
+
+    private IReadOnlyList<IPAddress> GetListenIPs(string configuredHost, bool supportZeroTier)
+    {
+        var ips = new List<IPAddress>();
+        var seen = new HashSet<IPAddress>();
+
+        void Add(IPAddress ip)
+        {
+            if (!IsSafeToListen(ip))
+            {
+                _logger.LogWarning("Refusing to listen on non-private IP {IP} (not a loopback/private address); skipping", ip);
+                return;
+            }
+            if (seen.Add(ip))
+                ips.Add(ip);
+        }
+
+        if (IPAddress.TryParse(configuredHost, out var cfgIp))
+            Add(cfgIp);
+
+        if (!supportZeroTier)
+            return ips;
+
+        try
+        {
+            foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
+            {
+                if (nic.OperationalStatus != OperationalStatus.Up)
+                    continue;
+                if (nic.NetworkInterfaceType == NetworkInterfaceType.Loopback)
+                    continue;
+
+                if (!IsZeroTierAdapter(nic))
+                    continue;
+
+                IPInterfaceProperties? props;
+                try { props = nic.GetIPProperties(); }
+                catch (NetworkInformationException) { continue; }
+                if (props is null) continue;
+
+                _logger.LogInformation("Found ZeroTier adapter \"{Name}\" ({Description})", nic.Name, nic.Description);
+
+                foreach (var ua in props.UnicastAddresses)
+                {
+                    var addr = ua.Address;
+                    if (addr.AddressFamily != AddressFamily.InterNetwork)
+                        continue;
+                    if (addr.IsIPv6LinkLocal || addr.IsIPv6SiteLocal)
+                        continue;
+                    Add(addr);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to enumerate network interfaces for ZeroTier detection");
+        }
+
+        return ips;
+    }
+
+    private static bool IsZeroTierAdapter(NetworkInterface nic)
+    {
+        var name = nic.Name ?? string.Empty;
+        var desc = nic.Description ?? string.Empty;
+        return name.Contains("ZeroTier", StringComparison.OrdinalIgnoreCase)
+            || desc.Contains("ZeroTier", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsSafeToListen(IPAddress addr)
+    {
+        if (addr.AddressFamily != AddressFamily.InterNetwork)
+            return false;
+
+        var bytes = addr.GetAddressBytes();
+        if (bytes.Length != 4) return false;
+
+        // 127.x.x.x loopback (entire /8) — includes 127.0.0.2
+        if (bytes[0] == 127) return true;
+
+        // 169.254.x.x link-local — never bind
+        if (bytes[0] == 169 && bytes[1] == 254) return false;
+
+        // 10.x.x.x private (ZeroTier managed range)
+        if (bytes[0] == 10) return true;
+
+        // 172.16.x.x - 172.31.x.x private
+        if (bytes[0] == 172 && bytes[1] >= 16 && bytes[1] <= 31) return true;
+
+        // 192.168.x.x private
+        if (bytes[0] == 192 && bytes[1] == 168) return true;
+
+        // Anything else is considered public/routable — REJECT
+        return false;
+    }
+
+    private const string ZeroTierFirewallRuleName = "OpenCode Web (ZeroTier Inbound)";
+
+    private void EnsureZeroTierFirewallRule(int port)
+    {
+        try
+        {
+            var existing = RunNetSh($"advfirewall firewall show rule name=\"{ZeroTierFirewallRuleName}\"");
+            if (existing.Contains("No rules match", StringComparison.OrdinalIgnoreCase) == false
+                && !string.IsNullOrWhiteSpace(existing))
+            {
+                _logger.LogDebug("Firewall rule \"{Rule}\" already exists", ZeroTierFirewallRuleName);
+                return;
+            }
+
+            _logger.LogInformation("Creating firewall rule \"{Rule}\" for TCP/{Port} (RemoteAddress 10.0.0.0/8)",
+                ZeroTierFirewallRuleName, port);
+
+            var output = RunNetSh(
+                $"advfirewall firewall add rule name=\"{ZeroTierFirewallRuleName}\" " +
+                $"dir=in action=allow protocol=TCP localport={port} " +
+                $"remoteip=10.0.0.0/8 profile=any enable=yes");
+
+            if (output.Contains("OK", StringComparison.OrdinalIgnoreCase))
+                _logger.LogInformation("Firewall rule \"{Rule}\" created", ZeroTierFirewallRuleName);
+            else
+                _logger.LogWarning("Firewall rule creation returned: {Output}", output.Trim());
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to ensure firewall rule \"{Rule}\"", ZeroTierFirewallRuleName);
+        }
+    }
+
+    private static string RunNetSh(string arguments)
+    {
+        var psi = new ProcessStartInfo
+        {
+            FileName = "netsh.exe",
+            Arguments = arguments,
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true,
+        };
+        using var process = Process.Start(psi);
+        if (process is null) return string.Empty;
+        var stdout = process.StandardOutput.ReadToEnd();
+        process.WaitForExit(5000);
+        return stdout ?? string.Empty;
+    }
+
+    private static bool IsFlagEnabled(string? value, bool defaultValue)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return defaultValue;
+        return value.Trim().Equals("true", StringComparison.OrdinalIgnoreCase)
+            || value.Trim().Equals("1", StringComparison.OrdinalIgnoreCase)
+            || value.Trim().Equals("yes", StringComparison.OrdinalIgnoreCase);
     }
 
     private static string ResolveOpenCodeFromPath()
